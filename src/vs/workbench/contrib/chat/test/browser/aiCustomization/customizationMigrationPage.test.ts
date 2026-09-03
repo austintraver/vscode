@@ -188,6 +188,7 @@ suite('SelectableCustomizationMigrationPage', () => {
 		try {
 			context.page.update({ loading: false, candidates });
 			context.container.querySelectorAll<HTMLElement>('.prompt-migration-checkbox [role="checkbox"]')[0].click();
+			context.page.update({ loading: true, candidates: [] });
 			context.page.update({
 				loading: false,
 				candidates: candidates.map(candidate => ({ ...candidate })),

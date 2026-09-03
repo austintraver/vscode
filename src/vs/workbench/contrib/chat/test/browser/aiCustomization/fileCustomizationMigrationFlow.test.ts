@@ -4,7 +4,9 @@
  *--------------------------------------------------------------------------------------------*/
 
 import assert from 'assert';
+import { IContextMenuDelegate } from '../../../../../../base/browser/contextmenu.js';
 import type { IManagedHover } from '../../../../../../base/browser/ui/hover/hover.js';
+import { IAction } from '../../../../../../base/common/actions.js';
 import { VSBuffer } from '../../../../../../base/common/buffer.js';
 import { Event } from '../../../../../../base/common/event.js';
 import { observableValue } from '../../../../../../base/common/observable.js';
@@ -25,6 +27,7 @@ import { CustomizationMigrationType, ICustomizationMigrationService, MigratableC
 import { PromptsStorage } from '../../../common/promptSyntax/service/promptsService.js';
 import { PromptFileSource, PromptsType } from '../../../common/promptSyntax/promptTypes.js';
 import { CustomizationMigrationCategoryId, getCustomizationMigrationCategory } from '../../../browser/aiCustomization/customizationMigrationCategories.js';
+import { ICustomizationMigrationModel, ICustomizationMigrationModelState } from '../../../browser/aiCustomization/customizationMigrationModel.js';
 import { CustomizationMigrationRunCoordinator, FileCustomizationMigrationFlow, ICustomizationMigrationRunCoordinator } from '../../../browser/aiCustomization/fileCustomizationMigrationFlow.js';
 import { workbenchInstantiationService } from '../../../../../test/browser/workbenchTestServices.js';
 
@@ -34,12 +37,13 @@ interface ITestFlowOptions {
 	readonly sourceFolders?: ReadonlyMap<PromptsType, readonly ICustomizationSourceFolder[]>;
 	readonly pick?: (items: readonly { folder: ICustomizationSourceFolder }[]) => Promise<{ folder: ICustomizationSourceFolder } | undefined>;
 	readonly runCoordinator?: ICustomizationMigrationRunCoordinator;
+	readonly confirmDelete?: boolean;
 }
 
 suite('FileCustomizationMigrationFlow', () => {
 	const store = ensureNoDisposablesAreLeakedInTestSuite();
 
-	function createTestFlow(categoryId: CustomizationMigrationCategoryId, options: ITestFlowOptions = {}) {
+	function createTestFlow(categoryId: CustomizationMigrationCategoryId.PromptFiles | CustomizationMigrationCategoryId.UserData, options: ITestFlowOptions = {}) {
 		const category = getCustomizationMigrationCategory(categoryId);
 		const values = new Map<string, unknown>([[category.enablementSetting, options.enabled ?? true]]);
 		const configurationService = {
@@ -73,11 +77,12 @@ suite('FileCustomizationMigrationFlow', () => {
 			getActiveProjectRoot: () => undefined,
 			deleteFiles: async () => undefined,
 		} as unknown as IAICustomizationWorkspaceService;
+		let deletedFileCount = 0;
 		const fileService = {
 			readFile: async () => ({ value: VSBuffer.fromString('---\nname: test\n---\nBody') }),
 			createFolder: async () => undefined,
 			createFile: async () => undefined,
-			del: async () => undefined,
+			del: async () => { deletedFileCount++; },
 			hasCapability: () => false,
 		} as unknown as IFileService;
 		const notifications: string[] = [];
@@ -86,8 +91,12 @@ suite('FileCustomizationMigrationFlow', () => {
 			warn: (message: string) => notifications.push(message),
 			info: (message: string) => notifications.push(message),
 		} as unknown as INotificationService;
+		let confirmationCount = 0;
 		const dialogService = {
-			confirm: async () => ({ confirmed: false }),
+			confirm: async () => {
+				confirmationCount++;
+				return { confirmed: options.confirmDelete === true };
+			},
 		} as unknown as IDialogService;
 		const quickInputService = {
 			pick: options.pick ?? (async (items: readonly { folder: ICustomizationSourceFolder }[]) => items[0]),
@@ -106,10 +115,51 @@ suite('FileCustomizationMigrationFlow', () => {
 				update() { },
 			}),
 		} as unknown as IHoverService;
+		let menuActions: readonly IAction[] = [];
+		let hideMenu: ((didCancel: boolean) => void) | undefined;
 		const contextMenuService = {
-			showContextMenu: () => undefined,
+			showContextMenu: (delegate: IContextMenuDelegate) => {
+				menuActions = delegate.getActions();
+				hideMenu = delegate.onHide;
+			},
 		} as unknown as IContextMenuService;
 		const runCoordinator = options.runCoordinator ?? store.add(new CustomizationMigrationRunCoordinator());
+		const modelState = observableValue<ICustomizationMigrationModelState>('migrationModelState', {
+			categories: new Map([[category.id, {
+				id: category.id,
+				migrationType: category.migrationType,
+				loading: false,
+				candidates: [],
+				targetFoldersByType: new Map(),
+			}]]),
+		});
+		const model: ICustomizationMigrationModel = {
+			state: modelState,
+			isCategoryEnabled: () => values.get(category.enablementSetting) === true,
+			captureContext: () => ({
+				generation: 0,
+				harnessId: activeHarness.get(),
+				sessionResource: activeSessionResource.get(),
+				rootsSignature: '',
+			}),
+			isContextCurrent: context => context.generation === 0
+				&& context.harnessId === activeHarness.get()
+				&& context.sessionResource.toString() === activeSessionResource.get().toString(),
+			refresh: async () => {
+				const migration = await migrationService.computeMigration(activeSessionResource.get(), category.migrationType);
+				const targetFolderEntries = await Promise.all([...new Set(migration.candidates.map(candidate => candidate.type === PromptsType.prompt ? PromptsType.skill : candidate.type))]
+					.map(async type => [type, sourceFolders.get(type) ?? []] as const));
+				modelState.set({
+					categories: new Map([[category.id, {
+						id: category.id,
+						migrationType: category.migrationType,
+						loading: false,
+						candidates: migration.candidates,
+						targetFoldersByType: new Map(targetFolderEntries),
+					}]]),
+				}, undefined);
+			},
+		};
 		const opened: MigratableConfiguration[] = [];
 		const revealed: (readonly { uri: URI; type: PromptsType }[])[] = [];
 		const instantiationService = workbenchInstantiationService(undefined, store);
@@ -133,6 +183,7 @@ suite('FileCustomizationMigrationFlow', () => {
 				revealMigratedFiles: async customizations => { revealed.push(customizations); },
 			},
 			runCoordinator,
+			model,
 		));
 		const container = document.createElement('div');
 		document.body.appendChild(container);
@@ -150,10 +201,15 @@ suite('FileCustomizationMigrationFlow', () => {
 			setEnabled: (enabled: boolean) => values.set(category.enablementSetting, enabled),
 			setCandidates: (newCandidates: readonly MigratableConfiguration[]) => { candidates = newCandidates; },
 			setSourceFolders: (newSourceFolders: ReadonlyMap<PromptsType, readonly ICustomizationSourceFolder[]>) => { sourceFolders = newSourceFolders; },
+			getConfirmationCount: () => confirmationCount,
+			getDeletedFileCount: () => deletedFileCount,
+			getMenuActions: () => menuActions,
+			hideMenu: () => hideMenu?.(false),
 		};
 	}
 
 	function disposeTestFlow(context: ReturnType<typeof createTestFlow>): void {
+		context.hideMenu();
 		context.flow.deactivate();
 		context.container.remove();
 	}
@@ -226,23 +282,16 @@ suite('FileCustomizationMigrationFlow', () => {
 		}
 	});
 
-	test('suppresses prompt refreshes only while migration writes are in progress', async () => {
+	test('refreshes from the shared model while another flow owns the run lock', async () => {
 		const context = createTestFlow(CustomizationMigrationCategoryId.UserData);
 		try {
 			await context.flow.refresh();
 			const runLock = context.runCoordinator.tryAcquire();
 			assert.ok(runLock);
-			context.flow.refreshFromPromptChange();
-			await new Promise(resolve => setTimeout(resolve, 0));
-			const writeLock = context.runCoordinator.beginWrite();
-			context.flow.refreshFromPromptChange();
-			await new Promise(resolve => setTimeout(resolve, 0));
-			writeLock.dispose();
-			context.flow.refreshFromPromptChange();
-			await new Promise(resolve => setTimeout(resolve, 0));
+			await context.flow.refresh();
 			runLock.dispose();
 
-			assert.deepStrictEqual(context.computeSessions, ['/session-a', '/session-a', '/session-a']);
+			assert.deepStrictEqual(context.computeSessions, ['/session-a', '/session-a']);
 		} finally {
 			disposeTestFlow(context);
 		}
@@ -347,6 +396,52 @@ suite('FileCustomizationMigrationFlow', () => {
 			});
 		} finally {
 			runLock.dispose();
+			disposeTestFlow(context);
+		}
+	});
+
+	test('does not delete a file while another migration owns the shared run lock', async () => {
+		const promptFile: MigratableConfiguration = {
+			uri: URI.file('/workspace/review.prompt.md'),
+			storage: PromptsStorage.local,
+			type: PromptsType.prompt,
+			source: PromptFileSource.GitHubWorkspace,
+		};
+		const context = createTestFlow(CustomizationMigrationCategoryId.PromptFiles, {
+			candidates: [promptFile],
+			confirmDelete: true,
+		});
+		try {
+			await context.flow.refresh();
+			context.container.querySelector<HTMLElement>('.prompt-migration-more-action')?.click();
+			const deleteAction = context.getMenuActions()[0];
+			const runLock = context.runCoordinator.tryAcquire();
+			assert.ok(runLock);
+			await deleteAction.run();
+			const whileLocked = {
+				confirmationCount: context.getConfirmationCount(),
+				deletedFileCount: context.getDeletedFileCount(),
+			};
+			runLock.dispose();
+			await deleteAction.run();
+
+			assert.deepStrictEqual({
+				whileLocked,
+				afterRelease: {
+					confirmationCount: context.getConfirmationCount(),
+					deletedFileCount: context.getDeletedFileCount(),
+				},
+			}, {
+				whileLocked: {
+					confirmationCount: 0,
+					deletedFileCount: 0,
+				},
+				afterRelease: {
+					confirmationCount: 1,
+					deletedFileCount: 1,
+				},
+			});
+		} finally {
 			disposeTestFlow(context);
 		}
 	});

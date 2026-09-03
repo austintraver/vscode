@@ -22,6 +22,7 @@ import { IModelService } from '../../../../../editor/common/services/model.js';
 import { IResolvedTextEditorModel, ITextModelService } from '../../../../../editor/common/services/resolverService.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { IFileContent, IFileService, IFileStatWithMetadata } from '../../../../../platform/files/common/files.js';
+import { NullLogService } from '../../../../../platform/log/common/log.js';
 import { PluginFormat } from '../../../../../platform/agentPlugins/common/pluginParsers.js';
 import { IListService, ListService } from '../../../../../platform/list/browser/listService.js';
 import { IQuickInputService } from '../../../../../platform/quickinput/common/quickInput.js';
@@ -47,7 +48,7 @@ import { IAICustomizationWorkspaceService, AICustomizationManagementSection, AIC
 import { ICustomizationHarnessService, ICustomizationItem, ICustomizationItemProvider, ICustomizationSourceFolder, IHarnessDescriptor, createVSCodeHarnessDescriptor } from '../../../../contrib/chat/common/customizationHarnessService.js';
 import { IChatSessionsService } from '../../../../contrib/chat/common/chatSessionsService.js';
 import { getChatSessionType, LocalChatSessionUri } from '../../../../contrib/chat/common/model/chatUri.js';
-import { ICustomizationMigrationService } from '../../../../contrib/chat/common/promptSyntax/service/customizationMigrationService.js';
+import { CustomizationMigration, CustomizationMigrationType, FileCustomizationMigration, FileCustomizationMigrationType, ICustomizationMigrationService, IMcpServerCustomizationMigrationCandidate, IMcpServerCustomizationMigrationResult, McpServerCustomizationMigration } from '../../../../contrib/chat/common/promptSyntax/service/customizationMigrationService.js';
 import { CustomizationMigrationService } from '../../../../contrib/chat/browser/aiCustomization/customizationMigrationServiceImpl.js';
 import { IPromptsService, AgentInstructionFileType, PromptsStorage, IAgentSkill, IChatPromptSlashCommand, IAgentInstructionFile } from '../../../../contrib/chat/common/promptSyntax/service/promptsService.js';
 import { IResolvedPromptSourceFolder } from '../../../../contrib/chat/common/promptSyntax/config/promptFileLocations.js';
@@ -704,6 +705,32 @@ interface IRenderEditorOptions {
 	readonly migrationCategory?: CustomizationMigrationCategoryId;
 }
 
+class FixtureMcpCustomizationMigrationService implements ICustomizationMigrationService {
+	declare readonly _serviceBrand: undefined;
+
+	constructor(private readonly candidates: readonly IMcpServerCustomizationMigrationCandidate[]) { }
+
+	computeMigration(_sessionResource: URI, type: FileCustomizationMigrationType): Promise<FileCustomizationMigration>;
+	computeMigration(_sessionResource: URI, type: CustomizationMigrationType.McpServers): Promise<McpServerCustomizationMigration>;
+	computeMigration(_sessionResource: URI, type: CustomizationMigrationType): Promise<CustomizationMigration> {
+		return Promise.resolve(type === CustomizationMigrationType.McpServers
+			? { type, servers: [], candidates: this.candidates, discoveryComplete: true, coverage: { restrictedByMcpAccess: false, restrictedByCustomizationPolicy: false } }
+			: { type, files: [], candidates: [] });
+	}
+
+	computeMigrations(): Promise<CustomizationMigration[]> {
+		return Promise.resolve([]);
+	}
+
+	computeMigrationHint(): Promise<string | undefined> {
+		return Promise.resolve(undefined);
+	}
+
+	migrateMcpServers(): Promise<IMcpServerCustomizationMigrationResult> {
+		return Promise.resolve({ migratedCount: 0, failures: [] });
+	}
+}
+
 function renderFixtureMarkdown(markdown: string): HTMLElement {
 	const container = DOM.$('div.fixture-rendered-markdown');
 	const lines = markdown.split(/\r?\n/);
@@ -874,14 +901,28 @@ async function renderEditor(ctx: ComponentFixtureContext, options: IRenderEditor
 			const promptsService = createMockPromptsService(fixtureFiles, agentInstructions, fileContents, promptFilesDidChangeEmitter.event);
 			reg.defineInstance(IPromptsService, promptsService);
 			const agentHostCustomizationService = createMockAgentHostCustomizationService(options.activeSessionMcpServers);
-			reg.defineInstance(ICustomizationMigrationService, new CustomizationMigrationService(
-				promptsService,
-				harnessService,
-				new class extends mock<IAgentHostActiveClientService>() {
-					override acquireMcpServerSupportScope() { return undefined; }
-				}(),
-				agentHostCustomizationService,
-			));
+			if (options.migrationCategory === CustomizationMigrationCategoryId.McpServers) {
+				const candidates: IMcpServerCustomizationMigrationCandidate[] = ['Workspace Files', 'Issue Tracker', 'Build Tools'].map((name, index) => ({
+					type: CustomizationMigrationType.McpServers,
+					id: `fixture-${index}`,
+					name,
+					sourceUri: URI.file(index < 2 ? '/workspace/.vscode/mcp.json' : '/workspace/packages/app/.vscode/mcp.json'),
+					targetUri: URI.file(index < 2 ? '/workspace/.mcp.json' : '/workspace/packages/app/.mcp.json'),
+					projectedConfiguration: { type: McpServerType.LOCAL, command: 'node' },
+				}));
+				reg.defineInstance(ICustomizationMigrationService, new FixtureMcpCustomizationMigrationService(candidates));
+			} else {
+				reg.defineInstance(ICustomizationMigrationService, ctx.disposableStore.add(new CustomizationMigrationService(
+					promptsService,
+					harnessService,
+					new class extends mock<IAgentHostActiveClientService>() {
+						override acquireMcpServerSupportScope() { return undefined; }
+					}(),
+					agentHostCustomizationService,
+					new class extends mock<IFileService>() { }(),
+					new NullLogService(),
+				)));
+			}
 			reg.defineInstance(IAICustomizationWorkspaceService, new class extends mock<IAICustomizationWorkspaceService>() {
 				override readonly isSessionsWindow = isSessionsWindow;
 				override readonly welcomePageFeatures = {
@@ -1999,6 +2040,14 @@ export default defineThemedFixtureGroup({ path: 'chat/aiCustomizations/' }, {
 			sessionResource: agentHostCopilotSessionResource,
 			migrationCategory: CustomizationMigrationCategoryId.PromptFiles,
 			emptyMigrationUserSection: true,
+		}),
+	}),
+
+	McpServerMigration: defineComponentFixture({
+		labels: { kind: 'screenshot' },
+		render: ctx => renderEditor(ctx, {
+			sessionResource: agentHostCopilotSessionResource,
+			migrationCategory: CustomizationMigrationCategoryId.McpServers,
 		}),
 	}),
 

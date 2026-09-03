@@ -4,22 +4,21 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as DOM from '../../../../../base/browser/dom.js';
-import { Event } from '../../../../../base/common/event.js';
-import { Disposable } from '../../../../../base/common/lifecycle.js';
-import { autorun, derived, IObservable } from '../../../../../base/common/observable.js';
+import { assertNever } from '../../../../../base/common/assert.js';
+import { Disposable, IDisposable } from '../../../../../base/common/lifecycle.js';
+import { derived, IObservable } from '../../../../../base/common/observable.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
-import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
-import { ICustomizationHarnessService } from '../../common/customizationHarnessService.js';
-import { MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
-import { IPromptsService } from '../../common/promptSyntax/service/promptsService.js';
-import { CUSTOMIZATION_MIGRATION_CATEGORIES, CustomizationMigrationCategoryId } from './customizationMigrationCategories.js';
+import { CustomizationMigrationType, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
+import { CUSTOMIZATION_MIGRATION_CATEGORIES, CustomizationMigrationCategoryId, ICustomizationMigrationCategory } from './customizationMigrationCategories.js';
 import { IMigratedCustomization } from './customizationMigration.js';
 import { CustomizationMigrationRunCoordinator, FileCustomizationMigrationFlow, IFileCustomizationMigrationFlowDelegate } from './fileCustomizationMigrationFlow.js';
 import { ICustomizationMigrationCategorySummary } from './aiCustomizationWelcomePage.js';
+import { CustomizationMigrationModel } from './customizationMigrationModel.js';
+import { McpServerCustomizationMigrationFlow } from './mcpServerCustomizationMigrationFlow.js';
 
 const $ = DOM.$;
 
-export interface ICustomizationMigrationFlow {
+export interface ICustomizationMigrationFlow extends IDisposable {
 	readonly id: CustomizationMigrationCategoryId;
 	readonly backLabel: string;
 	readonly summary: IObservable<ICustomizationMigrationCategorySummary | undefined>;
@@ -27,7 +26,6 @@ export interface ICustomizationMigrationFlow {
 	activate(container: HTMLElement): void;
 	deactivate(): void;
 	refresh(): Promise<void>;
-	refreshFromPromptChange(): void;
 	focus(): void;
 	setVisible(visible: boolean): void;
 	layout(): void;
@@ -45,49 +43,26 @@ export class CustomizationMigrationWidget extends Disposable {
 	readonly summaries: IObservable<readonly ICustomizationMigrationCategorySummary[]>;
 
 	private readonly flows: readonly ICustomizationMigrationFlow[];
+	private readonly model: CustomizationMigrationModel;
 	private activeFlow: ICustomizationMigrationFlow | undefined;
 	private visible = false;
 
 	constructor(
 		navigationDelegate: ICustomizationMigrationNavigationDelegate,
 		@IInstantiationService instantiationService: IInstantiationService,
-		@IConfigurationService configurationService: IConfigurationService,
-		@ICustomizationHarnessService harnessService: ICustomizationHarnessService,
-		@IPromptsService promptsService: IPromptsService,
 	) {
 		super();
 
 		this.element = $('.prompt-migration-content-container.ai-customization-list-widget');
 		const flowDelegate: IFileCustomizationMigrationFlowDelegate = navigationDelegate;
 		const runCoordinator = this._register(new CustomizationMigrationRunCoordinator());
+		this.model = this._register(instantiationService.createInstance(CustomizationMigrationModel, runCoordinator.writesInProgress));
 		this.flows = CUSTOMIZATION_MIGRATION_CATEGORIES.map(category => this._register(
-			instantiationService.createInstance(FileCustomizationMigrationFlow, category, flowDelegate, runCoordinator)
+			this.createFlow(category, flowDelegate, runCoordinator, instantiationService)
 		));
 		this.summaries = derived(this, reader => this.flows
 			.map(flow => flow.summary.read(reader))
 			.filter((summary): summary is ICustomizationMigrationCategorySummary => summary !== undefined));
-
-		this._register(autorun(reader => {
-			harnessService.activeSessionResource.read(reader);
-			void this.refresh();
-		}));
-
-		this._register(Event.any(
-			promptsService.onDidChangeSlashCommands,
-			promptsService.onDidChangeCustomAgents,
-			promptsService.onDidChangeInstructions,
-			promptsService.onDidChangeAgentInstructions,
-		)(() => {
-			for (const flow of this.flows) {
-				flow.refreshFromPromptChange();
-			}
-		}));
-
-		this._register(configurationService.onDidChangeConfiguration(event => {
-			if (CUSTOMIZATION_MIGRATION_CATEGORIES.some(category => event.affectsConfiguration(category.enablementSetting))) {
-				void this.refresh();
-			}
-		}));
 	}
 
 	get activeBackLabel(): string | undefined {
@@ -113,7 +88,7 @@ export class CustomizationMigrationWidget extends Disposable {
 	}
 
 	async refresh(): Promise<void> {
-		await Promise.all(this.flows.map(flow => flow.refresh()));
+		await this.model.refresh();
 	}
 
 	setVisible(visible: boolean): void {
@@ -128,5 +103,22 @@ export class CustomizationMigrationWidget extends Disposable {
 
 	layout(): void {
 		this.activeFlow?.layout();
+	}
+
+	private createFlow(
+		category: ICustomizationMigrationCategory,
+		fileDelegate: IFileCustomizationMigrationFlowDelegate,
+		runCoordinator: CustomizationMigrationRunCoordinator,
+		instantiationService: IInstantiationService,
+	): ICustomizationMigrationFlow {
+		switch (category.migrationType) {
+			case CustomizationMigrationType.PromptFiles:
+			case CustomizationMigrationType.UserData:
+				return instantiationService.createInstance(FileCustomizationMigrationFlow, category, fileDelegate, runCoordinator, this.model);
+			case CustomizationMigrationType.McpServers:
+				return instantiationService.createInstance(McpServerCustomizationMigrationFlow, category, runCoordinator, this.model);
+			default:
+				return assertNever(category);
+		}
 	}
 }

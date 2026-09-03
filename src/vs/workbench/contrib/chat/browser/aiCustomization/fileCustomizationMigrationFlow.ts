@@ -4,17 +4,15 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { timeout } from '../../../../../base/common/async.js';
-import { CancellationToken } from '../../../../../base/common/cancellation.js';
 import { Codicon } from '../../../../../base/common/codicons.js';
-import { getErrorMessage, onUnexpectedError } from '../../../../../base/common/errors.js';
+import { onUnexpectedError } from '../../../../../base/common/errors.js';
 import { Disposable, IDisposable, toDisposable } from '../../../../../base/common/lifecycle.js';
 import { ResourceSet } from '../../../../../base/common/map.js';
-import { IObservable, observableValue } from '../../../../../base/common/observable.js';
+import { autorun, IObservable, observableValue } from '../../../../../base/common/observable.js';
 import { dirname as dirnamePath } from '../../../../../base/common/path.js';
 import { basename, dirname, isEqual } from '../../../../../base/common/resources.js';
 import { URI } from '../../../../../base/common/uri.js';
 import { localize } from '../../../../../nls.js';
-import { IConfigurationService } from '../../../../../platform/configuration/common/configuration.js';
 import { IDialogService } from '../../../../../platform/dialogs/common/dialogs.js';
 import { FileSystemProviderCapabilities, IFileService } from '../../../../../platform/files/common/files.js';
 import { IInstantiationService } from '../../../../../platform/instantiation/common/instantiation.js';
@@ -22,14 +20,14 @@ import { ILabelService } from '../../../../../platform/label/common/label.js';
 import { INotificationService } from '../../../../../platform/notification/common/notification.js';
 import { IQuickInputService, IQuickPickItem } from '../../../../../platform/quickinput/common/quickInput.js';
 import { IAICustomizationWorkspaceService } from '../../common/aiCustomizationWorkspaceService.js';
-import { isAgentHostTarget } from '../../common/chatSessionsService.js';
 import { ICustomizationHarnessService, ICustomizationSourceFolder } from '../../common/customizationHarnessService.js';
-import { CustomizationMigrationType, getCustomizationMigrationTargetType, ICustomizationMigrationService, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
+import { CustomizationMigrationType, getCustomizationMigrationTargetType, MigratableConfiguration } from '../../common/promptSyntax/service/customizationMigrationService.js';
 import { PromptsStorage } from '../../common/promptSyntax/service/promptsService.js';
 import { PromptsType } from '../../common/promptSyntax/promptTypes.js';
 import { ICustomizationMigrationCategorySummary } from './aiCustomizationWelcomePage.js';
 import { CustomizationMigrationTargetFolders, IMigratedCustomization, IMigratedCustomizationsResult, migrateCustomizations } from './customizationMigration.js';
-import { CustomizationMigrationCategoryId, ICustomizationMigrationCategory } from './customizationMigrationCategories.js';
+import { CustomizationMigrationCategoryId, IFileCustomizationMigrationCategory } from './customizationMigrationCategories.js';
+import { ICustomizationMigrationModel, IFileCustomizationMigrationCategoryState } from './customizationMigrationModel.js';
 import { ICustomizationMigrationPageDelegate, SelectableCustomizationMigrationPage } from './customizationMigrationPage.js';
 import type { ICustomizationMigrationFlow } from './customizationMigrationWidget.js';
 
@@ -78,17 +76,14 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 	private readonly page: SelectableCustomizationMigrationPage<MigratableConfiguration>;
 	private candidates: readonly MigratableConfiguration[] = [];
 	private targetFoldersByType = new Map<PromptsType, readonly ICustomizationSourceFolder[]>();
-	private refreshSequence = 0;
-	private loading = false;
-	private loadError: string | undefined;
+	private state: IFileCustomizationMigrationCategoryState;
 
 	constructor(
-		readonly category: ICustomizationMigrationCategory,
+		readonly category: IFileCustomizationMigrationCategory,
 		private readonly delegate: IFileCustomizationMigrationFlowDelegate,
 		private readonly runCoordinator: ICustomizationMigrationRunCoordinator,
+		private readonly model: ICustomizationMigrationModel,
 		@IInstantiationService instantiationService: IInstantiationService,
-		@IConfigurationService private readonly configurationService: IConfigurationService,
-		@ICustomizationMigrationService private readonly customizationMigrationService: ICustomizationMigrationService,
 		@ICustomizationHarnessService private readonly harnessService: ICustomizationHarnessService,
 		@IAICustomizationWorkspaceService private readonly workspaceService: IAICustomizationWorkspaceService,
 		@IFileService private readonly fileService: IFileService,
@@ -98,18 +93,19 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 		@ILabelService private readonly labelService: ILabelService,
 	) {
 		super();
+		this.state = {
+			id: category.id,
+			migrationType: category.migrationType,
+			loading: false,
+			candidates: [],
+			targetFoldersByType: new Map(),
+		};
 		const pageDelegate: ICustomizationMigrationPageDelegate<MigratableConfiguration> = {
 			getCandidateKey: customization => `${customization.uri.toString()}:${customization.storage}`,
-			getCandidatePresentation: customization => {
-				const displayName = customization.name ?? basename(customization.uri);
-				const relativePath = this.labelService.getUriLabel(customization.uri, { relative: true });
-				return {
-					name: displayName,
-					pathLabel: relativePath,
-					selectionAriaLabel: localize('customizationMigrationSelectAriaLabel', "Select {0}", displayName),
-					openAriaLabel: localize('openCustomizationFile', "Open {0}, {1}", displayName, relativePath),
-				};
-			},
+			getCandidatePresentation: customization => this.category.getCandidatePresentation(
+				customization,
+				uri => this.labelService.getUriLabel(uri, { relative: true }),
+			),
 			getCandidateActions: customization => [{
 				id: 'customizationMigration.delete',
 				label: localize('delete', "Delete"),
@@ -123,7 +119,7 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 			})),
 			openCandidate: customization => this.delegate.openFileCustomization(customization),
 			migrate: customizations => this.migrateSelectedCustomizations(customizations),
-			retry: () => this.refresh(),
+			retry: () => this.model.refresh([this.id]),
 		};
 		this.page = this._register(instantiationService.createInstance(
 			SelectableCustomizationMigrationPage<MigratableConfiguration>,
@@ -131,6 +127,17 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 			this.runCoordinator.inProgress,
 			pageDelegate,
 		));
+		this._register(autorun(reader => {
+			const state = this.model.state.read(reader).categories.get(this.id);
+			if (!state || state.migrationType === CustomizationMigrationType.McpServers) {
+				return;
+			}
+			this.state = state;
+			this.candidates = state.candidates;
+			this.targetFoldersByType = new Map(state.targetFoldersByType);
+			this.updateSummary();
+			this.updatePage();
+		}));
 	}
 
 	get id(): CustomizationMigrationCategoryId {
@@ -150,58 +157,11 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 	}
 
 	isEnabled(): boolean {
-		return this.configurationService.getValue<boolean>(this.category.enablementSetting) === true;
+		return this.model.isCategoryEnabled(this.id);
 	}
 
-	async refresh(): Promise<void> {
-		const activeHarnessId = this.harnessService.activeHarness.get();
-		const activeSessionResource = this.harnessService.activeSessionResource.get();
-		const refreshSequence = ++this.refreshSequence;
-		this.loading = true;
-		this.loadError = undefined;
-		this.updatePage();
-
-		if (!this.isEnabled() || !isAgentHostTarget(activeHarnessId)) {
-			this.loading = false;
-			this.setCandidates([], new Map());
-			return;
-		}
-
-		try {
-			const migrationType = this.category.id === CustomizationMigrationCategoryId.PromptFiles
-				? CustomizationMigrationType.PromptFiles
-				: CustomizationMigrationType.UserData;
-			const migration = await this.customizationMigrationService.computeMigration(activeSessionResource, migrationType);
-			if (!this.isRefreshCurrent(refreshSequence, activeHarnessId, activeSessionResource)) {
-				return;
-			}
-
-			const provider = this.harnessService.findHarnessById(activeHarnessId)?.itemProvider;
-			const targetTypes = new Set(migration.candidates.map(getCustomizationMigrationTargetType));
-			const targetFolderEntries = await Promise.all([...targetTypes].map(async targetType => {
-				const folders = await provider?.provideSourceFolders?.(activeSessionResource, targetType, CancellationToken.None);
-				return [targetType, folders ?? []] as const;
-			}));
-			if (!this.isRefreshCurrent(refreshSequence, activeHarnessId, activeSessionResource)) {
-				return;
-			}
-
-			this.loading = false;
-			this.setCandidates(migration.candidates, new Map(targetFolderEntries));
-		} catch (error) {
-			if (refreshSequence === this.refreshSequence) {
-				this.loading = false;
-				this.loadError = getErrorMessage(error);
-				this.updatePage();
-			}
-			onUnexpectedError(error);
-		}
-	}
-
-	refreshFromPromptChange(): void {
-		if (!this.runCoordinator.writesInProgress.get()) {
-			void this.refresh();
-		}
+	refresh(): Promise<void> {
+		return this.model.refresh([this.id]);
 	}
 
 	focus(): void {
@@ -220,6 +180,7 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 		customizations: readonly MigratableConfiguration[],
 		availableSourceFolders: ReadonlyMap<PromptsType, readonly ICustomizationSourceFolder[]>,
 		sessionResource: URI,
+		isContextCurrent: () => boolean = () => this.isSessionActive(sessionResource),
 	): Promise<CustomizationMigrationTargetFolders | undefined> {
 		const requiredStorageByTargetType = new Map<PromptsType, Set<PromptsStorage>>();
 		for (const customization of customizations) {
@@ -233,7 +194,7 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 		const selectedDestinationGroupIds = new Map<PromptsStorage, string>();
 		for (const [targetType, requiredStorages] of requiredStorageByTargetType) {
 			const availableFolders = availableSourceFolders.get(targetType) ?? [];
-			if (!this.isSessionActive(sessionResource)) {
+			if (!isContextCurrent()) {
 				return undefined;
 			}
 			const foldersByStorage = new Map<PromptsStorage, ICustomizationSourceFolder>();
@@ -259,7 +220,7 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 						selectedDestinationGroupIds.set(storage, targetFolder.destinationGroupId);
 					}
 				}
-				if (!targetFolder || !this.isSessionActive(sessionResource)) {
+				if (!targetFolder || !isContextCurrent()) {
 					return undefined;
 				}
 				foldersByStorage.set(storage, targetFolder);
@@ -269,21 +230,8 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 		return targetFolders;
 	}
 
-	private isRefreshCurrent(refreshSequence: number, activeHarnessId: string, activeSessionResource: URI): boolean {
-		return refreshSequence === this.refreshSequence
-			&& activeHarnessId === this.harnessService.activeHarness.get()
-			&& isEqual(activeSessionResource, this.harnessService.activeSessionResource.get());
-	}
-
-	private setCandidates(candidates: readonly MigratableConfiguration[], targetFoldersByType: Map<PromptsType, readonly ICustomizationSourceFolder[]>): void {
-		this.candidates = candidates;
-		this.targetFoldersByType = targetFoldersByType;
-		this.updateSummary();
-		this.updatePage();
-	}
-
 	private getCandidates(): readonly MigratableConfiguration[] {
-		return this.isEnabled() ? this.candidates : [];
+		return this.isEnabled() && !this.state.loading && !this.state.loadError ? this.candidates : [];
 	}
 
 	private updateSummary(): void {
@@ -301,8 +249,8 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 	private updatePage(): void {
 		const candidates = this.getCandidates();
 		this.page.update({
-			loading: this.loading,
-			loadError: this.loadError,
+			loading: this.state.loading,
+			loadError: this.state.loadError,
 			candidates,
 		});
 	}
@@ -322,9 +270,14 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 			return;
 		}
 		try {
-			const sessionResource = this.harnessService.activeSessionResource.get();
-			const targetFolders = await this.resolveTargetFolders(customizations, this.targetFoldersByType, sessionResource);
-			if (!targetFolders || !this.isSessionActive(sessionResource)) {
+			const context = this.model.captureContext();
+			const targetFolders = await this.resolveTargetFolders(
+				customizations,
+				this.targetFoldersByType,
+				context.sessionResource,
+				() => this.model.isContextCurrent(context),
+			);
+			if (!targetFolders || !this.model.isContextCurrent(context)) {
 				return;
 			}
 
@@ -343,7 +296,7 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 				},
 				primaryButton: confirmation.primaryButton,
 			});
-			if (!confirmResult.confirmed || !this.isSessionActive(sessionResource)) {
+			if (!confirmResult.confirmed || !this.model.isContextCurrent(context)) {
 				return;
 			}
 
@@ -365,7 +318,7 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 			}
 
 			if (deleteOriginalFiles) {
-				await this.refresh();
+				await this.model.refresh([this.id]);
 			}
 
 			const unsupportedKeysLabel = unsupportedHeaderKeys.join(', ');
@@ -392,27 +345,41 @@ export class FileCustomizationMigrationFlow extends Disposable implements ICusto
 	}
 
 	private async deleteCustomizationFile(customization: MigratableConfiguration): Promise<void> {
-		const fileName = customization.name ?? basename(customization.uri);
-		const confirmation = await this.dialogService.confirm({
-			message: localize('confirmDeleteCustomizationFile', "Are you sure you want to delete '{0}'?", fileName),
-			detail: localize('confirmDeleteDetail', "This action cannot be undone."),
-			primaryButton: localize('delete', "Delete"),
-			type: 'warning',
-		});
-		if (!confirmation.confirmed) {
+		const runLock = this.runCoordinator.tryAcquire();
+		if (!runLock) {
 			return;
 		}
-
-		const useTrash = this.fileService.hasCapability(customization.uri, FileSystemProviderCapabilities.Trash);
-		await this.fileService.del(customization.uri, { useTrash });
-		if (customization.storage === PromptsStorage.local) {
-			const projectRoot = this.workspaceService.getActiveProjectRoot();
-			if (projectRoot) {
-				await this.workspaceService.deleteFiles(projectRoot, [customization.uri]);
+		try {
+			const fileName = customization.name ?? basename(customization.uri);
+			const confirmation = await this.dialogService.confirm({
+				message: localize('confirmDeleteCustomizationFile', "Are you sure you want to delete '{0}'?", fileName),
+				detail: localize('confirmDeleteDetail', "This action cannot be undone."),
+				primaryButton: localize('delete', "Delete"),
+				type: 'warning',
+			});
+			if (!confirmation.confirmed) {
+				return;
 			}
-		}
 
-		this.setCandidates(this.candidates.filter(item => !isEqual(item.uri, customization.uri)), this.targetFoldersByType);
+			const writeLock = this.runCoordinator.beginWrite();
+			try {
+				const useTrash = this.fileService.hasCapability(customization.uri, FileSystemProviderCapabilities.Trash);
+				await this.fileService.del(customization.uri, { useTrash });
+				if (customization.storage === PromptsStorage.local) {
+					const projectRoot = this.workspaceService.getActiveProjectRoot();
+					if (projectRoot) {
+						await this.workspaceService.deleteFiles(projectRoot, [customization.uri]);
+					}
+				}
+			} finally {
+				await timeout(0);
+				writeLock.dispose();
+			}
+
+			await this.model.refresh([this.id]);
+		} finally {
+			runLock.dispose();
+		}
 	}
 
 	private isSessionActive(sessionResource: URI): boolean {

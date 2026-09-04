@@ -149,43 +149,43 @@ suite('customizationMigration', () => {
 			migrated: 'Migrated 1 user data customization.',
 			failed: 'Failed to migrate 1 user data customization: reviewer.agent.md.',
 		});
+	});
 
-		test('presents MCP source-to-target migration without file-only behavior', () => {
-			const category = getCustomizationMigrationCategory(CustomizationMigrationCategoryId.McpServers);
-			const candidate = {
-				type: CustomizationMigrationType.McpServers,
-				id: 'server',
+	test('presents MCP source-to-target migration without file-only behavior', () => {
+		const category = getCustomizationMigrationCategory(CustomizationMigrationCategoryId.McpServers);
+		const candidate = {
+			type: CustomizationMigrationType.McpServers,
+			id: 'server',
+			name: 'Server',
+			sourceUri: URI.file('/workspace/.vscode/mcp.json'),
+			targetUri: URI.file('/workspace/.mcp.json'),
+			projectedConfiguration: { type: McpServerType.LOCAL, command: 'node' },
+		} as const;
+
+		assert.deepStrictEqual({
+			presentation: category.getCandidatePresentation(candidate, uri => uri.path),
+			description: category.getPageDescription([candidate], 'Copilot'),
+			confirmation: category.getConfirmation([candidate], 'Copilot'),
+			failure: category.getFailureMessage([{
+				id: candidate.id,
+				name: candidate.name,
+				sourceUri: candidate.sourceUri,
+				targetUri: candidate.targetUri,
+				reason: McpServerCustomizationMigrationFailureReason.TargetConflict,
+			}]),
+		}, {
+			presentation: {
 				name: 'Server',
-				sourceUri: URI.file('/workspace/.vscode/mcp.json'),
-				targetUri: URI.file('/workspace/.mcp.json'),
-				projectedConfiguration: { type: McpServerType.LOCAL, command: 'node' },
-			} as const;
-
-			assert.deepStrictEqual({
-				presentation: category.getCandidatePresentation(candidate, uri => uri.path),
-				description: category.getPageDescription([candidate], 'Copilot'),
-				confirmation: category.getConfirmation([candidate], 'Copilot'),
-				failure: category.getFailureMessage([{
-					id: candidate.id,
-					name: candidate.name,
-					sourceUri: candidate.sourceUri,
-					targetUri: candidate.targetUri,
-					reason: McpServerCustomizationMigrationFailureReason.TargetConflict,
-				}]),
-			}, {
-				presentation: {
-					name: 'Server',
-					selectionAriaLabel: 'Select Server from /workspace/.vscode/mcp.json',
-					pathLabel: '/workspace/.vscode/mcp.json to /workspace/.mcp.json',
-				},
-				description: 'Select the supported MCP server to move so Copilot can discover it directly. Unsupported and unselected servers stay in .vscode/mcp.json.',
-				confirmation: {
-					message: 'Migrate 1 MCP server to .mcp.json?',
-					detail: 'Selected entries are removed from .vscode/mcp.json after they are written and verified in .mcp.json. Unsupported and unselected entries stay in place.',
-					primaryButton: 'Migrate',
-				},
-				failure: 'Could not migrate \'Server\' because .mcp.json already contains a different server with that name.',
-			});
+				selectionAriaLabel: 'Select Server from /workspace/.vscode/mcp.json',
+				pathLabel: '/workspace/.vscode/mcp.json to /workspace/.mcp.json',
+			},
+			description: 'Select the supported MCP server to move so Copilot can discover it directly. Unsupported and unselected servers stay in .vscode/mcp.json.',
+			confirmation: {
+				message: 'Migrate 1 MCP server to .mcp.json?',
+				detail: 'Selected entries are removed from .vscode/mcp.json after they are written and verified in .mcp.json. Unsupported and unselected entries stay in place.',
+				primaryButton: 'Migrate',
+			},
+			failure: 'Could not migrate \'Server\' because .mcp.json already contains a different server with that name.',
 		});
 	});
 

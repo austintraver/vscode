@@ -12,7 +12,6 @@ import { ensureNoDisposablesAreLeakedInTestSuite } from '../../../../../../base/
 import { IContextMenuService } from '../../../../../../platform/contextview/browser/contextView.js';
 import { IDialogService } from '../../../../../../platform/dialogs/common/dialogs.js';
 import { IHoverService } from '../../../../../../platform/hover/browser/hover.js';
-import { TestInstantiationService } from '../../../../../../platform/instantiation/test/common/instantiationServiceMock.js';
 import { ILabelService } from '../../../../../../platform/label/common/label.js';
 import { INotificationService } from '../../../../../../platform/notification/common/notification.js';
 import { IOpenerService } from '../../../../../../platform/opener/common/opener.js';
@@ -23,6 +22,7 @@ import { CustomizationMigrationRunCoordinator } from '../../../browser/aiCustomi
 import { McpServerCustomizationMigrationFlow } from '../../../browser/aiCustomization/mcpServerCustomizationMigrationFlow.js';
 import { ICustomizationHarnessService } from '../../../common/customizationHarnessService.js';
 import { CustomizationMigration, CustomizationMigrationType, FileCustomizationMigration, FileCustomizationMigrationType, ICustomizationMigrationService, IMcpServerCustomizationMigrationCandidate, IMcpServerCustomizationMigrationResult, McpServerCustomizationMigration, McpServerCustomizationMigrationFailureReason } from '../../../common/promptSyntax/service/customizationMigrationService.js';
+import { workbenchInstantiationService } from '../../../../../test/browser/workbenchTestServices.js';
 
 class TestMigrationService implements ICustomizationMigrationService {
 	declare readonly _serviceBrand: undefined;
@@ -109,7 +109,7 @@ suite('McpServerCustomizationMigrationFlow', () => {
 			info: (message: string) => notifications.push(message),
 		} as unknown as INotificationService;
 		const migrationService = new TestMigrationService();
-		const instantiationService = store.add(new TestInstantiationService());
+		const instantiationService = workbenchInstantiationService(undefined, store);
 		instantiationService.stub(ICustomizationMigrationService, migrationService);
 		instantiationService.stub(ICustomizationHarnessService, harnessService);
 		instantiationService.stub(IDialogService, dialogService);
@@ -125,6 +125,10 @@ suite('McpServerCustomizationMigrationFlow', () => {
 		const container = document.createElement('div');
 		document.body.appendChild(container);
 		flow.activate(container);
+		flow.setVisible(true);
+		const listContainer = container.querySelector<HTMLElement>('.prompt-migration-list')!;
+		Object.defineProperty(listContainer, 'clientHeight', { configurable: true, value: 224 });
+		flow.layout();
 		return {
 			flow,
 			container,
@@ -142,7 +146,7 @@ suite('McpServerCustomizationMigrationFlow', () => {
 		const context = createFlow();
 		try {
 			assert.deepStrictEqual(
-				[...context.container.querySelectorAll('.prompt-migration-item-path')].map(element => element.textContent),
+				[...context.container.querySelectorAll('.item-text:not([style*="display: none"]) .prompt-migration-item-path')].map(element => element.textContent),
 				[
 					'/workspace/.vscode/mcp.json to /workspace/.mcp.json',
 					'/other/.vscode/mcp.json to /other/.mcp.json',

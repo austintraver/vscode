@@ -104,6 +104,10 @@ export class McpServerCustomizationMigrationFlow extends Disposable implements I
 		this.page.focus();
 	}
 
+	setVisible(visible: boolean): void {
+		this.page.setVisible(visible);
+	}
+
 	layout(): void {
 		this.page.layout();
 	}

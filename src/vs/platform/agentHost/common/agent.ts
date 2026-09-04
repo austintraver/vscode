@@ -278,6 +278,8 @@ export interface AuthenticateParams {
 
 	/** The bearer token value (RFC 6750). */
 	readonly token: string;
+	/** The access token's remaining lifetime in seconds, when known. */
+	readonly expiresIn?: number;
 }
 
 /** Request for a previously accepted bearer token. */
@@ -1233,7 +1235,7 @@ export interface IAgent {
 	getProtectedResources(): ProtectedResourceMetadata[];
 
 	/** An empty token revokes the credential previously forwarded for this resource. */
-	authenticate(resource: string, token: string): Promise<boolean>;
+	authenticate(resource: string, token: string, expiresIn?: number): Promise<boolean>;
 
 	/** Optional token consumer for provider-owned resources such as MCP servers. */
 	handleAuthenticationToken?(params: AuthenticateParams): Promise<boolean>;

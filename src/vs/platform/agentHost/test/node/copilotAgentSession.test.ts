@@ -45,11 +45,12 @@ import { toHostSnapshotAttachmentMeta } from '../../common/meta/agentSnapshotAtt
 import { STREAMING_TOOL_DISPLAY_INTERVAL_MS } from '../../common/streamingToolCallDisplay.js';
 import { CustomizationEnablementKind, CustomizationType, McpAuthRequiredReason, McpServerStatus, type Customization, type McpServerCustomization } from '../../common/state/protocol/channels-session/state.js';
 import { CopilotAgentSession } from '../../node/copilot/copilotAgentSession.js';
+import { CopilotGitHubTokenProvider } from '../../node/copilot/copilotGitHubTokenProvider.js';
 import { buildNonPtyShellTerminalUri } from '../../node/copilot/copilotNonPtyShellTerminals.js';
 import { buildMcpChannel } from '../../node/shared/mcpCustomizationController.js';
 import { buildSandboxConfigForSdk } from '../../node/copilot/sandboxConfigForSdk.js';
 import { ActiveClientToolSet } from '../../node/activeClientState.js';
-import { type CopilotSessionLaunchPlan, type IActiveClientSnapshot, type ICopilotSessionLauncher, type ICopilotSessionRuntime } from '../../node/copilot/copilotSessionLauncher.js';
+import { type CopilotGitHubSessionCredentials, type CopilotSessionLaunchPlan, type IActiveClientSnapshot, type ICopilotSessionLauncher, type ICopilotSessionRuntime } from '../../node/copilot/copilotSessionLauncher.js';
 import { CopilotSessionWrapper } from '../../node/copilot/copilotSessionWrapper.js';
 import { AgentHostStateManager, IAgentHostStateManager } from '../../node/agentHostStateManager.js';
 import { IAgentHostCustomizationEnablementService, type CustomizationEnablementResolution, type ICustomizationEnablementTarget } from '../../node/agentHostCustomizationEnablementService.js';
@@ -723,12 +724,12 @@ async function createAgentSession(disposables: DisposableStore, options?: {
 	/** Platform used to compute the SDK sandbox policy. Defaults to `'linux'` so sandbox tests are deterministic. */
 	platform?: NodeJS.Platform;
 	githubToken?: string;
+	githubCredentials?: CopilotGitHubSessionCredentials;
 	copilotApiEndpoint?: string;
 	gitService?: IAgentHostGitService;
 	gitHubEndpointService?: IAgentHostGitHubEndpointService;
 	restrictedTelemetryContext?: IRestrictedTelemetryContext;
 	restrictedTelemetryContextError?: Error;
-	isLaunchTokenCurrent?: () => boolean;
 	onTurnEnded?: () => void;
 	modelId?: string;
 	enableDevelopmentErrorInjection?: boolean;
@@ -792,7 +793,7 @@ async function createAgentSession(disposables: DisposableStore, options?: {
 		resolvedAgentName: undefined,
 		snapshot: options?.clientSnapshot ?? { tools: [], plugins: [], mcpServers: {} },
 		shellManager: undefined,
-		githubToken: options?.githubToken,
+		githubCredentials: options?.githubCredentials ?? { kind: 'token', token: options?.githubToken },
 		isEphemeral: options?.isEphemeral,
 		hasScopedEditSurface: options?.hasScopedEditSurface,
 	};
@@ -987,7 +988,6 @@ async function createAgentSession(disposables: DisposableStore, options?: {
 			workingDirectory: options?.workingDirectory,
 			serverToolHost: options?.serverToolHost,
 			platform: options?.platform ?? 'linux',
-			isLaunchTokenCurrent: options?.isLaunchTokenCurrent,
 			onTurnEnded: options?.onTurnEnded,
 			enableDevelopmentErrorInjection: options?.enableDevelopmentErrorInjection ?? true,
 		},
@@ -12065,9 +12065,10 @@ Use the attached image as context.
 		});
 
 		test('drops an in-flight capture when the launch token is no longer current', async () => {
-			let tokenCurrent = true;
 			const workingDirectory = URI.file('/repo');
 			const telemetryService = new CapturingRestrictedTelemetryService();
+			const gitHubTokenProvider = disposables.add(new CopilotGitHubTokenProvider());
+			gitHubTokenProvider.updateToken('github-token', 7200);
 			const gitService: IAgentHostGitService = {
 				...createNoopGitService(),
 				getRepositoryRoot: async () => workingDirectory,
@@ -12082,8 +12083,7 @@ Use the attached image as context.
 				workingDirectory,
 				gitService,
 				telemetryService,
-				githubToken: 'github-token',
-				isLaunchTokenCurrent: () => tokenCurrent,
+				githubCredentials: { kind: 'provider', provider: gitHubTokenProvider },
 				restrictedTelemetryContext: {
 					restrictedTelemetryEnabled: true,
 					trackingId: 'tracking-id',
@@ -12095,7 +12095,7 @@ Use the attached image as context.
 				},
 			});
 			mockSession.fire('assistant.turn_start', { turnId: 'root-turn' });
-			tokenCurrent = false;
+			gitHubTokenProvider.updateToken('replacement-token', 7200);
 			await timeout(0);
 
 			assert.deepStrictEqual(telemetryService.events.filter(event => event.eventName === 'request.repoInfo'), []);
